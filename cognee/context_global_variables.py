@@ -128,6 +128,7 @@ async def set_database_global_context_variables(dataset: Union[str, UUID], user_
         "vector_db_url": dataset_database.vector_database_url,
         "vector_db_key": dataset_database.vector_database_key,
         "vector_db_name": dataset_database.vector_database_name,
+        "vector_database_connection_info": dataset_database.vector_database_connection_info,
     }
 
     graph_config = {

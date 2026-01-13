@@ -22,7 +22,7 @@ class CustomPGVectorDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
     """
     Handler for CustomPGVector dataset database management.
 
-    CustomPGVector uses a unified table (custom_embeddings) with RLS policies
+    CustomPGVector uses per-collection tables with RLS policies
     to provide dataset and tenant isolation.
     """
 
@@ -42,21 +42,25 @@ class CustomPGVectorDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         db_name: str = db_url.split("/")[-1].split("?")[0] if "/" in db_url else "cognee"
 
         tenant_id: str | None = None
+        user_id: str | None = None
 
         if user is not None:
             # Using getattr avoids the "Column vsp None" overlap error in BasedPyright
             # as it treats the returned value as Any/Unknown at access time.
             user_tenant_id = getattr(user, "tenant_id", None)
-            user_id = getattr(user, "id", None)
+            user_id_val = getattr(user, "id", None)
 
             if user_tenant_id is not None:
                 tenant_id = str(user_tenant_id)
-            elif user_id is not None:
-                tenant_id = str(user_id)
+            elif user_id_val is not None:
+                tenant_id = str(user_id_val)
+
+            if user_id_val is not None:
+                user_id = str(user_id_val)
 
         logger.info(
             f"Creating CustomPGVector dataset entry: " +
-            f"dataset={dataset_id}, tenant={tenant_id}"
+            f"dataset={dataset_id}, tenant={tenant_id}, user={user_id}"
         )
 
         return {
@@ -68,6 +72,7 @@ class CustomPGVectorDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
             "vector_database_connection_info": {
                 "dataset_id": str(dataset_id) if dataset_id is not None else None,
                 "tenant_id": tenant_id,
+                "user_id": user_id,  # Added for RLS user permission checks
                 "rls_enabled": True,
             },
         }

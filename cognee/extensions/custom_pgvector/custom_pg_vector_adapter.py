@@ -1,9 +1,11 @@
 import asyncio
+from contextlib import asynccontextmanager
 from sqlite3 import ProgrammingError
-from typing import List, Union, Optional, Any, override, get_type_hints
+from typing import List, Union, Optional, Any, override, get_type_hints, AsyncGenerator
+from uuid import UUID
 from asyncpg import DeadlockDetectedError, DuplicateTableError, UniqueViolationError
-from sqlalchemy import delete, select, func, inspect, Column, JSON, MetaData, Table
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy import delete, select, func, inspect, Column, JSON, MetaData, Table, text, UUID as SQLUUID
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import mapped_column, Mapped
 from sqlalchemy.dialects.postgresql import insert
 
@@ -56,6 +58,142 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         from pgvector.sqlalchemy import Vector
 
         self.Vector = Vector
+
+    def _extract_connection_info(self) -> dict:
+        """
+        Extract RLS context from vector_database_connection_info.
+
+        This information flows from:
+        1. DatasetDatabase.vector_database_connection_info (stored in DB)
+        2. Populated by CustomPGVectorDatasetDatabaseHandler during dataset creation
+        3. Made available through vector_db_config context variable
+
+        Returns:
+            dict with keys: dataset_id, tenant_id, user_id, rls_enabled
+        """
+        from cognee.context_global_variables import vector_db_config
+
+        # Get context config which includes connection_info
+        context_config = vector_db_config.get() if vector_db_config.get() else {}
+
+        # Extract connection info
+        connection_info = context_config.get('vector_database_connection_info', {})
+
+        return {
+            'dataset_id': connection_info.get('dataset_id'),
+            'tenant_id': connection_info.get('tenant_id'),
+            'user_id': connection_info.get('user_id'),
+            'rls_enabled': connection_info.get('rls_enabled', True)
+        }
+
+    @asynccontextmanager
+    async def get_async_session_with_rls(self) -> AsyncGenerator[AsyncSession, None]:
+        """
+        Provide an async session with RLS context variables set.
+
+        Uses SET LOCAL to ensure variables are transaction-scoped and automatically
+        cleared when the transaction ends.
+        """
+        async with self.get_async_session() as session:
+            # Extract RLS context
+            context = self._extract_connection_info()
+
+            # Only set session variables if using PostgreSQL
+            if self.engine.dialect.name == "postgresql":
+                # Set session variables using SET LOCAL (transaction-scoped)
+                if context['dataset_id']:
+                    await session.execute(text(f"SET LOCAL app.dataset_id = '{context['dataset_id']}';"))
+
+                if context['tenant_id']:
+                    await session.execute(text(f"SET LOCAL app.tenant_id = '{context['tenant_id']}';"))
+
+                if context['user_id']:
+                    await session.execute(text(f"SET LOCAL app.user_id = '{context['user_id']}';"))
+
+                # Set RLS enabled flag
+                rls_enabled = 'true' if context['rls_enabled'] else 'false'
+                await session.execute(text(f"SET LOCAL app.rls_enabled = '{rls_enabled}';"))
+
+            try:
+                yield session
+            finally:
+                # SET LOCAL variables are automatically cleared on transaction end
+                pass
+
+    async def _create_rls_policies(self, connection, table_name: str):
+        """
+        Create RLS policies for a collection table.
+
+        Policy Logic:
+        1. Tenant isolation: current_setting('app.tenant_id') = tenant_id
+        2. Access control: Owner OR has ACL read permission
+        3. Read-only enforcement at DB level
+        """
+        # Only create RLS policies for PostgreSQL
+        if self.engine.dialect.name != "postgresql":
+            return
+
+        try:
+            # Enable RLS on the table
+            await connection.execute(text(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY;'))
+
+            # Drop existing policies if they exist (for idempotency)
+            await connection.execute(text(f'DROP POLICY IF EXISTS "{table_name}_rls_policy" ON "{table_name}";'))
+
+            # Create comprehensive RLS policy for SELECT operations
+            rls_policy_sql = f"""
+            CREATE POLICY "{table_name}_rls_policy" ON "{table_name}"
+            FOR SELECT
+            USING (
+                -- Check if RLS is enabled for this request
+                CASE
+                    WHEN current_setting('app.rls_enabled', true) = 'false' THEN true
+                    ELSE (
+                        -- Tenant isolation
+                        (tenant_id::text = current_setting('app.tenant_id', true))
+                        AND
+                        -- Access control: owner OR has read permission
+                        (
+                            -- Check if user is the dataset owner
+                            EXISTS (
+                                SELECT 1 FROM datasets
+                                WHERE datasets.id = "{table_name}".dataset_id
+                                AND datasets.owner_id::text = current_setting('app.user_id', true)
+                            )
+                            OR
+                            -- Check if user has ACL read permission
+                            EXISTS (
+                                SELECT 1 FROM acls
+                                JOIN permissions ON acls.permission_id = permissions.id
+                                WHERE acls.dataset_id = "{table_name}".dataset_id
+                                AND acls.principal_id::text = current_setting('app.user_id', true)
+                                AND permissions.name = 'read'
+                            )
+                        )
+                    )
+                END
+            );
+            """
+            await connection.execute(text(rls_policy_sql))
+
+            # Create restrictive policies for INSERT/UPDATE/DELETE (application-controlled)
+            # These ensure writes can only happen when RLS is explicitly disabled
+            await connection.execute(text(f"""
+            DROP POLICY IF EXISTS "{table_name}_write_policy" ON "{table_name}";
+            """))
+
+            await connection.execute(text(f"""
+            CREATE POLICY "{table_name}_write_policy" ON "{table_name}"
+            FOR ALL
+            USING (current_setting('app.rls_enabled', true) = 'false');
+            """))
+
+            logger.info(f"RLS policies created successfully for table: {table_name}")
+        except Exception as e:
+            logger.warning(f"Failed to create RLS policies for {table_name}: {e}")
+            # Don't fail the entire operation if RLS policy creation fails
+            # This allows the extension to work even without RLS support
+
     @override
     async def embed_data(self, data: list[str]) -> list[list[float]]:
         """
@@ -123,10 +261,12 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                         This class inherits from Base and is associated with a database table defined by
                         __tablename__. It maintains the following public methods and instance variables:
 
-                        - __init__(self, id, payload, vector): Initializes a new CustomPGVectorDataPoint instance.
+                        - __init__(self, id, dataset_id, tenant_id, payload, vector): Initializes a new CustomPGVectorDataPoint instance.
 
                         Instance variables:
                         - id: Identifier for the data point, defined by data_point_types.
+                        - dataset_id: UUID of the dataset this data point belongs to (for RLS).
+                        - tenant_id: UUID of the tenant this data point belongs to (for RLS).
                         - payload: JSON data associated with the data point.
                         - vector: Vector representation of the data point, with size defined by vector_size.
                         """
@@ -135,11 +275,17 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                         __table_args__ = {"extend_existing": True}
                         # PGVector requires one column to be the primary key
                         id: Mapped[data_point_types["id"]] = mapped_column(primary_key=True)
+                        # RLS columns for tenant and dataset isolation
+                        dataset_id = Column(SQLUUID, nullable=False, index=True)
+                        tenant_id = Column(SQLUUID, nullable=True, index=True)
+                        # Data columns
                         payload = Column(JSON)
                         vector = Column(self.Vector(vector_size))
 
-                        def __init__(self, id, payload, vector):
+                        def __init__(self, id, dataset_id, tenant_id, payload, vector):
                             self.id = id
+                            self.dataset_id = dataset_id
+                            self.tenant_id = tenant_id
                             self.payload = payload
                             self.vector = vector
 
@@ -148,6 +294,10 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                             await connection.run_sync(
                                 Base.metadata.create_all, tables=[CustomPGVectorDataPoint.__table__]
                             )
+
+                    # Create RLS policies after table creation (in separate connection context)
+                    async with self.engine.begin() as connection:
+                        await self._create_rls_policies(connection, collection_name)
 
     @retry(
         retry=retry_if_exception_type(DeadlockDetectedError),
@@ -169,6 +319,11 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
         vector_size = self.embedding_engine.get_vector_size()
 
+        # Extract context for dataset_id and tenant_id
+        context = self._extract_connection_info()
+        dataset_id = context['dataset_id']
+        tenant_id = context['tenant_id']
+
         class CustomPGVectorDataPoint(Base):
             """
             Represents a data point in a PGVector database. This class maps to a table defined by
@@ -176,6 +331,8 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
             It contains the following public instance variables:
             - id: An identifier for the data point.
+            - dataset_id: UUID of the dataset this data point belongs to (for RLS).
+            - tenant_id: UUID of the tenant this data point belongs to (for RLS).
             - payload: A JSON object containing additional data related to the data point.
             - vector: A vector representation of the data point, configured to the specified size.
             """
@@ -184,35 +341,27 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             __table_args__ = {"extend_existing": True}
             # PGVector requires one column to be the primary key
             id: Mapped[data_point_types["id"]] = mapped_column(primary_key=True)
+            dataset_id = Column(SQLUUID, nullable=False, index=True)
+            tenant_id = Column(SQLUUID, nullable=True, index=True)
             payload = Column(JSON)
             vector = Column(self.Vector(vector_size))
 
-            def __init__(self, id, payload, vector):
+            def __init__(self, id, dataset_id, tenant_id, payload, vector):
                 self.id = id
+                self.dataset_id = dataset_id
+                self.tenant_id = tenant_id
                 self.payload = payload
                 self.vector = vector
 
-        async with self.get_async_session() as session:
+        async with self.get_async_session_with_rls() as session:
             pgvector_data_points = []
 
             for data_index, data_point in enumerate(data_points):
-                # Check to see if data should be updated or a new data item should be created
-                # data_point_db = (
-                #     await session.execute(
-                #         select(CustomPGVectorDataPoint).filter(CustomPGVectorDataPoint.id == data_point.id)
-                #     )
-                # ).scalar_one_or_none()
-
-                # If data point exists update it, if not create a new one
-                # if data_point_db:
-                #     data_point_db.id = data_point.id
-                #     data_point_db.vector = data_vectors[data_index]
-                #     data_point_db.payload = serialize_data(data_point.model_dump())
-                #     pgvector_data_points.append(data_point_db)
-                # else:
                 pgvector_data_points.append(
                     CustomPGVectorDataPoint(
                         id=data_point.id,
+                        dataset_id=dataset_id,
+                        tenant_id=tenant_id,
                         vector=data_vectors[data_index],
                         payload=serialize_data(data_point.model_dump()),
                     )
@@ -224,7 +373,6 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                     for column in inspect(obj).mapper.column_attrs
                 }
 
-            # session.add_all(pgvector_data_points)
             insert_statement = insert(CustomPGVectorDataPoint).values(
                 [to_dict(data_point) for data_point in pgvector_data_points]
             )
@@ -274,7 +422,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         # Get PGVectorDataPoint Table from database
         PGVectorDataPoint = await self.get_table(collection_name)
 
-        async with self.get_async_session() as session:
+        async with self.get_async_session_with_rls() as session:
             results = await session.execute(
                 select(PGVectorDataPoint).where(PGVectorDataPoint.c.id.in_(data_point_ids))
             )
@@ -304,7 +452,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         PGVectorDataPoint = await self.get_table(collection_name)
 
         if limit is None:
-            async with self.get_async_session() as session:
+            async with self.get_async_session_with_rls() as session:
                 query = select(func.count()).select_from(PGVectorDataPoint)
                 result = await session.execute(query)
                 limit = result.scalar_one()
@@ -316,8 +464,8 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         # NOTE: This needs to be initialized in case search doesn't return a value
         closest_items = []
 
-        # Use async session to connect to the database
-        async with self.get_async_session() as session:
+        # Use RLS-enabled session for reads
+        async with self.get_async_session_with_rls() as session:
             query = select(
                 PGVectorDataPoint,
                 PGVectorDataPoint.c.vector.cosine_distance(query_vector).label("similarity"),
@@ -379,7 +527,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
     @override
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]):
-        async with self.get_async_session() as session:
+        async with self.get_async_session_with_rls() as session:
             # Get PGVectorDataPoint Table from database
             PGVectorDataPoint = await self.get_table(collection_name)
             results = await session.execute(
