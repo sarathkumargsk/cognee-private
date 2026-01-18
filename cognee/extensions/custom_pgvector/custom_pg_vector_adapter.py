@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from distributed.utils import override_distributed
 from distributed.tasks.queued_add_data_points import queued_add_data_points
-from .indexSchema import IndexSchema
+from .index_schema import IndexSchema
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.relational import get_relational_engine, Base
 from cognee.infrastructure.databases.relational.sqlalchemy.SqlAlchemyAdapter import SQLAlchemyAdapter
