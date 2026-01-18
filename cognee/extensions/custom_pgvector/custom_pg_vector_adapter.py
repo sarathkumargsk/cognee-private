@@ -61,28 +61,50 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
     def _extract_connection_info(self) -> dict:
         """
-        Extract RLS context from vector_database_connection_info.
+        Extract RLS context from vector_database_connection_info and session_user.
 
         This information flows from:
         1. DatasetDatabase.vector_database_connection_info (stored in DB)
         2. Populated by CustomPGVectorDatasetDatabaseHandler during dataset creation
         3. Made available through vector_db_config context variable
+        4. IMPORTANT: user_id and tenant_id are taken from session_user (current user)
+           not from stored connection_info (which has the original creator's info)
 
         Returns:
             dict with keys: dataset_id, tenant_id, user_id, rls_enabled
         """
-        from cognee.context_global_variables import vector_db_config
+        from cognee.context_global_variables import vector_db_config, session_user
 
         # Get context config which includes connection_info
         context_config = vector_db_config.get() if vector_db_config.get() else {}
 
-        # Extract connection info
+        # Extract connection info (dataset_id and rls_enabled from stored config)
         connection_info = context_config.get('vector_database_connection_info', {})
+
+        # Get the current session user - this is the user making the request,
+        # NOT the user who originally created the dataset
+        current_user = session_user.get()
+
+        # Use current user's info for RLS checks (user_id and tenant_id)
+        # Fall back to stored connection_info only if session_user is not set
+        if current_user is not None:
+            user_id = str(current_user.id) if current_user.id else None
+            tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+            logger.debug(
+                f"RLS context from session_user: user_id={user_id}, tenant_id={tenant_id}"
+            )
+        else:
+            user_id = connection_info.get('user_id')
+            tenant_id = connection_info.get('tenant_id')
+            logger.debug(
+                f"RLS context from connection_info (no session_user): "
+                f"user_id={user_id}, tenant_id={tenant_id}"
+            )
 
         return {
             'dataset_id': connection_info.get('dataset_id'),
-            'tenant_id': connection_info.get('tenant_id'),
-            'user_id': connection_info.get('user_id'),
+            'tenant_id': tenant_id,
+            'user_id': user_id,
             'rls_enabled': connection_info.get('rls_enabled', True)
         }
 
@@ -134,6 +156,16 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             return
 
         try:
+            # Grant SELECT on tables used in RLS policy subqueries
+            # This is required because RLS policy subqueries run with the
+            # permissions of the current user, not a superuser
+            # We use try/except for each grant as some may already exist or fail
+            for table in ['datasets', 'acls', 'permissions', 'user_roles']:
+                try:
+                    await connection.execute(text(f"GRANT SELECT ON {table} TO PUBLIC;"))
+                except Exception as grant_error:
+                    logger.debug(f"Grant on {table} skipped (may already exist): {grant_error}")
+
             # Enable RLS on the table
             await connection.execute(text(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY;'))
 
@@ -141,6 +173,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             await connection.execute(text(f'DROP POLICY IF EXISTS "{table_name}_rls_policy" ON "{table_name}";'))
 
             # Create comprehensive RLS policy for SELECT operations
+            # Supports permission inheritance: User → Role → Tenant
             rls_policy_sql = f"""
             CREATE POLICY "{table_name}_rls_policy" ON "{table_name}"
             FOR SELECT
@@ -152,7 +185,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                         -- Tenant isolation
                         (tenant_id::text = current_setting('app.tenant_id', true))
                         AND
-                        -- Access control: owner OR has read permission
+                        -- Access control: owner OR has read permission (direct, via role, or via tenant)
                         (
                             -- Check if user is the dataset owner
                             EXISTS (
@@ -161,12 +194,31 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                                 AND datasets.owner_id::text = current_setting('app.user_id', true)
                             )
                             OR
-                            -- Check if user has ACL read permission
+                            -- Check if user has direct ACL read permission
                             EXISTS (
                                 SELECT 1 FROM acls
                                 JOIN permissions ON acls.permission_id = permissions.id
                                 WHERE acls.dataset_id = "{table_name}".dataset_id
                                 AND acls.principal_id::text = current_setting('app.user_id', true)
+                                AND permissions.name = 'read'
+                            )
+                            OR
+                            -- Check if user has ACL read permission via role membership
+                            EXISTS (
+                                SELECT 1 FROM acls
+                                JOIN permissions ON acls.permission_id = permissions.id
+                                JOIN user_roles ON user_roles.role_id = acls.principal_id
+                                WHERE acls.dataset_id = "{table_name}".dataset_id
+                                AND user_roles.user_id::text = current_setting('app.user_id', true)
+                                AND permissions.name = 'read'
+                            )
+                            OR
+                            -- Check if tenant has ACL read permission
+                            EXISTS (
+                                SELECT 1 FROM acls
+                                JOIN permissions ON acls.permission_id = permissions.id
+                                WHERE acls.dataset_id = "{table_name}".dataset_id
+                                AND acls.principal_id::text = current_setting('app.tenant_id', true)
                                 AND permissions.name = 'read'
                             )
                         )

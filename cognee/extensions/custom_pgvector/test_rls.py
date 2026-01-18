@@ -185,9 +185,88 @@ async def test_rls_implementation():
     except Exception as e:
         print(f"✗ Search test error: {e}")
     
-    # Test 6: Verify RLS policies exist
+    # Test 6: Role-based permission access
     print("\n" + "-" * 80)
-    print("Test 6: Verifying RLS policies")
+    print("Test 6: Role-based permission access")
+    print("-" * 80)
+
+    try:
+        role_id = uuid4()
+        user_with_role_id = uuid4()
+
+        print("⚠ Note: This test requires the following setup:")
+        print("  1. Create a role in the 'roles' table")
+        print("  2. Add an ACL entry where principal_id = role_id")
+        print("  3. Add user_roles entry linking user to role")
+        print("")
+        print("  Example SQL setup:")
+        print(f"    INSERT INTO roles (id, name, tenant_id) VALUES ('{role_id}', 'test_role', '{tenant1_id}');")
+        print(f"    INSERT INTO user_roles (user_id, role_id) VALUES ('{user_with_role_id}', '{role_id}');")
+        print(f"    INSERT INTO acls (principal_id, dataset_id, permission_id) ")
+        print(f"      SELECT '{role_id}', '{dataset1_id}', id FROM permissions WHERE name = 'read';")
+        print("")
+        print("  Then search as user_with_role_id (who doesn't have direct permission)")
+        print("  User should be able to access data through role inheritance")
+
+    except Exception as e:
+        print(f"✗ Role-based permission test error: {e}")
+
+    # Test 7: Tenant-based permission access
+    print("\n" + "-" * 80)
+    print("Test 7: Tenant-based permission access")
+    print("-" * 80)
+
+    try:
+        user_in_tenant_id = uuid4()
+
+        print("⚠ Note: This test requires the following setup:")
+        print("  1. Add an ACL entry where principal_id = tenant_id")
+        print("  2. A user that belongs to the tenant but has no direct/role permission")
+        print("")
+        print("  Example SQL setup:")
+        print(f"    INSERT INTO acls (principal_id, dataset_id, permission_id) ")
+        print(f"      SELECT '{tenant1_id}', '{dataset1_id}', id FROM permissions WHERE name = 'read';")
+        print("")
+        print("  Then search as any user in tenant1 (even without direct permission)")
+        print("  User should be able to access data through tenant-level permission")
+
+    except Exception as e:
+        print(f"✗ Tenant-based permission test error: {e}")
+
+    # Test 8: Permission denied test
+    print("\n" + "-" * 80)
+    print("Test 8: Permission denied (no access)")
+    print("-" * 80)
+
+    try:
+        unauthorized_user_id = uuid4()
+
+        print("⚠ Note: This test verifies that users without any permission path cannot access data")
+        print("  1. User has no direct permission")
+        print("  2. User has no role with permission")
+        print("  3. User's tenant has no permission")
+        print("")
+        print("  Expected: Search returns empty results (data is filtered by RLS)")
+
+        # Switch context to an unauthorized user (same tenant but no permissions)
+        vector_db_config.set({
+            'vector_database_connection_info': {
+                'dataset_id': str(dataset1_id),
+                'tenant_id': str(tenant1_id),
+                'user_id': str(unauthorized_user_id),
+                'rls_enabled': True
+            }
+        })
+
+        print(f"  Set context: unauthorized user {unauthorized_user_id}")
+        print("  Note: Actual search test requires datasets table to exist")
+
+    except Exception as e:
+        print(f"✗ Permission denied test error: {e}")
+
+    # Test 9: Verify RLS policies exist
+    print("\n" + "-" * 80)
+    print("Test 9: Verifying RLS policies")
     print("-" * 80)
     
     if adapter.engine.dialect.name == "postgresql":
@@ -220,9 +299,9 @@ async def test_rls_implementation():
     else:
         print("⚠ Skipping RLS policy verification (not using PostgreSQL)")
     
-    # Test 7: Cleanup
+    # Test 10: Cleanup
     print("\n" + "-" * 80)
-    print("Test 7: Cleanup")
+    print("Test 10: Cleanup")
     print("-" * 80)
     
     try:
@@ -249,10 +328,21 @@ async def test_rls_implementation():
     print("\n" + "=" * 80)
     print("RLS Implementation Test Complete")
     print("=" * 80)
-    print("\nNext Steps:")
-    print("1. Create dataset records in the 'datasets' table")
-    print("2. Create ACL entries to grant permissions")
-    print("3. Run full end-to-end tests with cognee's permission system")
+    print("\nPermission Inheritance Hierarchy:")
+    print("  User → Role → Tenant")
+    print("")
+    print("Access is granted if ANY of these conditions are met:")
+    print("  1. User is the dataset owner")
+    print("  2. User has direct ACL 'read' permission")
+    print("  3. User's role has ACL 'read' permission")
+    print("  4. User's tenant has ACL 'read' permission")
+    print("")
+    print("Next Steps to fully test:")
+    print("  1. Create dataset records in the 'datasets' table")
+    print("  2. Create role records in the 'roles' table")
+    print("  3. Create user_roles entries to link users to roles")
+    print("  4. Create ACL entries for users, roles, or tenants")
+    print("  5. Run search queries to verify permission inheritance")
     print("=" * 80)
 
 
