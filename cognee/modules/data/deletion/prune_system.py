@@ -55,7 +55,8 @@ async def prune_system(graph=True, vector=True, metadata=True, cache=True):
         graph_engine = await get_graph_engine()
         await graph_engine.delete_graph()
     elif graph and backend_access_control_enabled():
-        await prune_graph_databases()
+        graph_engine = await get_graph_engine()
+        await graph_engine.delete_graph()
 
     if vector and not backend_access_control_enabled():
         vector_engine = get_vector_engine()
