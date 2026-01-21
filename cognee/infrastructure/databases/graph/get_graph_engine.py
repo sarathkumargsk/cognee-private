@@ -9,10 +9,16 @@ from .supported_databases import supported_databases
 
 async def get_graph_engine() -> GraphDBInterface:
     """Factory function to get the appropriate graph client based on the graph type."""
-    # Get appropriate graph configuration based on current async context
     config = get_graph_context_config()
 
-    graph_client = create_graph_engine(**config)
+    # Filter out non-hashable parameters that aren't part of create_graph_engine signature
+    # These parameters are used elsewhere (e.g., in adapters after initialization)
+    filtered_config = {
+        k: v for k, v in config.items()
+        if k not in ['graph_database_connection_info', 'vector_database_connection_info']
+    }
+
+    graph_client = create_graph_engine(**filtered_config)
 
     # Async functions can't be cached. After creating and caching the graph engine
     # handle all necessary async operations for different graph types bellow.

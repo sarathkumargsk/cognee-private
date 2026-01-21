@@ -145,6 +145,7 @@ async def set_database_global_context_variables(dataset: Union[str, UUID], user_
         "graph_database_password": dataset_database.graph_database_connection_info.get(
             "graph_database_password", ""
         ),
+        "graph_database_connection_info": dataset_database.graph_database_connection_info,
         "graph_dataset_database_handler": "",
         "graph_database_port": "",
     }

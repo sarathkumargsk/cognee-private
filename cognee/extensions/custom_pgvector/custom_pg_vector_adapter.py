@@ -90,28 +90,23 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         if current_user is not None:
             user_id = str(current_user.id) if current_user.id else None
             tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-            logger.debug(
-                f"RLS context from session_user: user_id={user_id}, tenant_id={tenant_id}"
-            )
         else:
             user_id = connection_info.get('user_id')
             tenant_id = connection_info.get('tenant_id')
-            logger.debug(
-                f"RLS context from connection_info (no session_user): "
-                f"user_id={user_id}, tenant_id={tenant_id}"
-            )
 
-        return {
+        extracted_context = {
             'dataset_id': connection_info.get('dataset_id'),
             'tenant_id': tenant_id,
             'user_id': user_id,
             'rls_enabled': connection_info.get('rls_enabled', True)
         }
 
+        return extracted_context
+
     @asynccontextmanager
     async def get_async_session_with_rls(self) -> AsyncGenerator[AsyncSession, None]:
         """
-        Provide an async session with RLS context variables set.
+        Provide an async session with RLS context variables set for READ operations.
 
         Uses SET LOCAL to ensure variables are transaction-scoped and automatically
         cleared when the transaction ends.
@@ -135,6 +130,39 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                 # Set RLS enabled flag
                 rls_enabled = 'true' if context['rls_enabled'] else 'false'
                 await session.execute(text(f"SET LOCAL app.rls_enabled = '{rls_enabled}';"))
+
+            try:
+                yield session
+            finally:
+                # SET LOCAL variables are automatically cleared on transaction end
+                pass
+
+    @asynccontextmanager
+    async def get_async_session_for_writes(self) -> AsyncGenerator[AsyncSession, None]:
+        """
+        Provide an async session with RLS disabled for WRITE operations.
+
+        This allows the application to insert data with proper dataset_id/tenant_id
+        while bypassing the RLS write policy check.
+        """
+        async with self.get_async_session() as session:
+            # Extract RLS context for metadata
+            context = self._extract_connection_info()
+
+            # Only set session variables if using PostgreSQL
+            if self.engine.dialect.name == "postgresql":
+                # Set context variables for logging/auditing
+                if context['dataset_id']:
+                    await session.execute(text(f"SET LOCAL app.dataset_id = '{context['dataset_id']}';"))
+
+                if context['tenant_id']:
+                    await session.execute(text(f"SET LOCAL app.tenant_id = '{context['tenant_id']}';"))
+
+                if context['user_id']:
+                    await session.execute(text(f"SET LOCAL app.user_id = '{context['user_id']}';"))
+
+                # DISABLE RLS for write operations
+                await session.execute(text("SET LOCAL app.rls_enabled = 'false';"))
 
             try:
                 yield session
@@ -166,8 +194,9 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                 except Exception as grant_error:
                     logger.debug(f"Grant on {table} skipped (may already exist): {grant_error}")
 
-            # Enable RLS on the table
+            # Enable RLS on the table (FORCE ensures it applies even to table owners)
             await connection.execute(text(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY;'))
+            await connection.execute(text(f'ALTER TABLE "{table_name}" FORCE ROW LEVEL SECURITY;'))
 
             # Drop existing policies if they exist (for idempotency)
             await connection.execute(text(f'DROP POLICY IF EXISTS "{table_name}_rls_policy" ON "{table_name}";'))
@@ -239,8 +268,6 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             FOR ALL
             USING (current_setting('app.rls_enabled', true) = 'false');
             """))
-
-            logger.info(f"RLS policies created successfully for table: {table_name}")
         except Exception as e:
             logger.warning(f"Failed to create RLS policies for {table_name}: {e}")
             # Don't fail the entire operation if RLS policy creation fails
@@ -405,7 +432,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                 self.payload = payload
                 self.vector = vector
 
-        async with self.get_async_session_with_rls() as session:
+        async with self.get_async_session_for_writes() as session:
             pgvector_data_points = []
 
             for data_index, data_point in enumerate(data_points):
@@ -530,9 +557,10 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             closest_items = await session.execute(query)
 
         vector_list = []
+        all_results = closest_items.all()
 
         # Extract distances and find min/max for normalization
-        for vector in closest_items.all():
+        for vector in all_results:
             vector_list.append(
                 {
                     "id": parse_id(str(vector.id)),
@@ -579,7 +607,7 @@ class CustomPGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
     @override
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]):
-        async with self.get_async_session_with_rls() as session:
+        async with self.get_async_session_for_writes() as session:
             # Get PGVectorDataPoint Table from database
             PGVectorDataPoint = await self.get_table(collection_name)
             results = await session.execute(

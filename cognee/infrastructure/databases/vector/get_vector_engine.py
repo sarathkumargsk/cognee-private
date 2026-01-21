@@ -3,7 +3,6 @@ from .create_vector_engine import create_vector_engine
 
 
 def get_vector_engine():
-    # Get appropriate vector db configuration based on current async context
     config = get_vectordb_context_config()
 
     # Filter out vector_database_connection_info as it's not a parameter for create_vector_engine

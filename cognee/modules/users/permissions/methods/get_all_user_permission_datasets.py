@@ -40,9 +40,18 @@ async def get_all_user_permission_datasets(user: User, permission_type: str) -> 
         unique.setdefault(dataset.id, dataset)
 
     # Filter out dataset that aren't part of the selected user's tenant
+    # CRITICAL: Must check tenant_id is not None to prevent cross-tenant data leakage
+    # If both are None, they should NOT be considered equal for security purposes
     filtered_datasets = []
     for dataset in list(unique.values()):
-        if dataset.tenant_id == user.tenant_id:
+        # Only include datasets that have an explicit tenant_id match
+        # Exclude None values to prevent cross-user data leakage when tenants aren't set
+        if dataset.tenant_id is not None and user.tenant_id is not None and dataset.tenant_id == user.tenant_id:
             filtered_datasets.append(dataset)
+        # If user has no tenant (single-user mode), only show datasets with no tenant
+        elif dataset.tenant_id is None and user.tenant_id is None:
+            # In single-user mode, further filter by owner to prevent cross-user access
+            if dataset.owner_id == user.id:
+                filtered_datasets.append(dataset)
 
     return filtered_datasets
